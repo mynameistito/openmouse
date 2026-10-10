@@ -1,18 +1,12 @@
 import { EGG_WE_HID_FILTERS } from "./egg-we-control";
+import { LOGITECH_RECEIVER_FILTERS, LOGITECH_VENDOR_ID } from "./logitech-hidpp";
 
 export const VENDOR_ID = {
   pulsar: 0x3710,
   endgameGear: 0x3367,
   wlmouse: 0x36a7,
-  logitech: 0x046d,
+  logitech: LOGITECH_VENDOR_ID,
 } as const;
-
-export const LOGITECH_RECEIVER_FILTER: HIDDeviceFilter = {
-  vendorId: VENDOR_ID.logitech,
-  productId: 0xc54d,
-  usagePage: 0xff00,
-  usage: 0x0001,
-};
 
 export const WLMOUSE_PRODUCTS: ReadonlyMap<number, { name: string; wireless: boolean }> = new Map([
   [0xa860, { name: "Beast G", wireless: true }],
@@ -49,5 +43,5 @@ export const SUPPORTED_HID_FILTERS: HIDDeviceFilter[] = [
   { vendorId: VENDOR_ID.endgameGear },
   { vendorId: VENDOR_ID.wlmouse },
   ...EGG_WE_HID_FILTERS,
-  LOGITECH_RECEIVER_FILTER,
+  ...LOGITECH_RECEIVER_FILTERS,
 ];

@@ -807,6 +807,7 @@ function showStatus(status: MouseStatus): void {
       && (isEgg || ui?.hideLodLow === true);
     button.hidden = hideLow;
     button.disabled = hideLow || settingsPending
+      || status.liftOffDistance === null
       || (status.brand === "Logitech" && button.dataset.lod === "Low");
   });
   document.querySelectorAll<HTMLButtonElement>("[data-dpi]").forEach((button) => {

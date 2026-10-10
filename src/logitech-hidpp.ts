@@ -1,7 +1,22 @@
 import type { MouseStatus } from "./mouse-types";
 
-const LOGITECH_VENDOR_ID = 0x046d;
-const LOGITECH_RECEIVER_PRODUCT_ID = 0xc54d;
+/** Logitech's USB vendor ID. */
+export const LOGITECH_VENDOR_ID = 0x046d;
+
+/** USB product IDs for Logitech receivers supported by this HID++ driver. */
+export const LOGITECH_RECEIVER_PRODUCT_IDS = [
+  0xc539, // G604 LIGHTSPEED
+  0xc54d, // PRO X SUPERLIGHT 2 receiver family
+] as const;
+
+/** WebHID chooser filters for supported Logitech HID++ receiver collections. */
+export const LOGITECH_RECEIVER_FILTERS: HIDDeviceFilter[] = LOGITECH_RECEIVER_PRODUCT_IDS.map((productId) => ({
+  vendorId: LOGITECH_VENDOR_ID,
+  productId,
+  usagePage: 0xff00,
+  usage: 0x0001,
+}));
+
 const SHORT_REPORT_ID = 0x10;
 const LONG_REPORT_ID = 0x11;
 const DEVICE_INDEX = 0x01;
@@ -9,10 +24,13 @@ const DEVICE_INDEX = 0x01;
 const FEATURE = {
   deviceName: 0x0005,
   firmware: 0x0003,
+  batteryStatus: 0x1000,
   unifiedBattery: 0x1004,
   batteryVoltage: 0x1001,
   adcMeasurement: 0x1f20,
+  adjustableDpi: 0x2201,
   extendedDpi: 0x2202,
+  reportRate: 0x8060,
   extendedReportRate: 0x8061,
   onboardProfiles: 0x8100,
 } as const;
@@ -37,6 +55,14 @@ interface FeatureInfo {
   index: number;
   version: number;
 }
+
+type DpiFeature =
+  | { kind: "adjustable"; info: FeatureInfo }
+  | { kind: "extended"; info: FeatureInfo };
+
+type ReportRateFeature =
+  | { kind: "standard"; info: FeatureInfo }
+  | { kind: "extended"; info: FeatureInfo };
 
 interface DpiConfiguration {
   x: number;
@@ -97,10 +123,14 @@ export class LogitechHidppClient {
     reject: (reason: Error) => void;
   }> = [];
 
-  constructor(readonly device: HIDDevice) {}
+  readonly device: HIDDevice;
+
+  constructor(device: HIDDevice) {
+    this.device = device;
+  }
 
   static isSupported(device: HIDDevice): boolean {
-    if (device.vendorId !== LOGITECH_VENDOR_ID || device.productId !== LOGITECH_RECEIVER_PRODUCT_ID) {
+    if (device.vendorId !== LOGITECH_VENDOR_ID || !LOGITECH_RECEIVER_PRODUCT_IDS.some((productId) => productId === device.productId)) {
       return false;
     }
     const hasHidppCollection = (collections: readonly HIDCollectionInfo[]): boolean =>
@@ -116,12 +146,7 @@ export class LogitechHidppClient {
     }
 
     const devices = await navigator.hid.requestDevice({
-      filters: [{
-        vendorId: LOGITECH_VENDOR_ID,
-        productId: LOGITECH_RECEIVER_PRODUCT_ID,
-        usagePage: 0xff00,
-        usage: 0x0001,
-      }],
+      filters: LOGITECH_RECEIVER_FILTERS,
     });
     const device = devices[0];
     return device ? new LogitechHidppClient(device) : null;
@@ -142,11 +167,12 @@ export class LogitechHidppClient {
 
     const nameFeature = await this.getFeature(FEATURE.deviceName);
     const firmwareFeature = await this.getFeature(FEATURE.firmware);
+    const batteryStatusFeature = await this.getFeature(FEATURE.batteryStatus);
     const batteryFeature = await this.getFeature(FEATURE.unifiedBattery);
     const batteryVoltageFeature = await this.getFeature(FEATURE.batteryVoltage);
     const adcMeasurementFeature = await this.getFeature(FEATURE.adcMeasurement);
-    const dpiFeature = await this.getFeature(FEATURE.extendedDpi);
-    const reportRateFeature = await this.getFeature(FEATURE.extendedReportRate);
+    const dpiFeature = await this.getDpiFeature();
+    const reportRateFeature = await this.getReportRateFeature();
     const profilesFeature = await this.getFeature(FEATURE.onboardProfiles);
 
     // HID++ receivers expect one request at a time. Keeping the sequence serial
@@ -155,20 +181,22 @@ export class LogitechHidppClient {
     const identity = await this.readIdentity(firmwareFeature.index);
     const battery = batteryFeature.index
       ? await this.readBattery(batteryFeature.index)
-      : batteryVoltageFeature.index
-        ? await this.readBatteryVoltage(batteryVoltageFeature.index)
-        : adcMeasurementFeature.index
-          ? await this.readAdcMeasurement(adcMeasurementFeature.index)
+      : batteryStatusFeature.index
+        ? await this.readBatteryStatus(batteryStatusFeature.index)
+        : batteryVoltageFeature.index
+          ? await this.readBatteryVoltage(batteryVoltageFeature.index)
+          : adcMeasurementFeature.index
+            ? await this.readAdcMeasurement(adcMeasurementFeature.index)
         : { percent: null, state: "Unknown" as const, voltageMv: null };
     if (batteryVoltageFeature.index && battery.voltageMv === undefined) {
       battery.voltageMv = (await this.readBatteryVoltage(batteryVoltageFeature.index)).voltageMv;
     } else if (adcMeasurementFeature.index && battery.voltageMv === undefined) {
       battery.voltageMv = (await this.readAdcMeasurement(adcMeasurementFeature.index)).voltageMv;
     }
-    const dpiState = await this.readDpi(dpiFeature.index);
-    const supportsSeparateDpiAxes = await this.readDpiCapabilities(dpiFeature.index);
-    const supportedPollingRates = await this.readSupportedPollingRates(reportRateFeature.index);
-    const pollingRateHz = await this.readPollingRate(reportRateFeature.index);
+    const dpiState = await this.readDpi(dpiFeature);
+    const supportsSeparateDpiAxes = await this.readDpiCapabilities(dpiFeature);
+    const supportedPollingRates = await this.readSupportedPollingRates(reportRateFeature);
+    const pollingRateHz = await this.readPollingRate(reportRateFeature);
     const profileState = await this.readProfileState(profilesFeature.index);
     const firmware = await this.readFirmware(firmwareFeature.index);
 
@@ -201,35 +229,45 @@ export class LogitechHidppClient {
   }
 
   async setPollingRate(pollingRateHz: number): Promise<number> {
+    await this.open();
+    await this.ensureHostControl();
+    const feature = await this.getReportRateFeature();
+    if (feature.kind === "standard") {
+      const periodMs = 1000 / pollingRateHz;
+      if (!Number.isInteger(periodMs) || periodMs < 1 || periodMs > 8) {
+        throw new Error("Unsupported polling rate.");
+      }
+      await this.request(feature.info.index, 0x20, periodMs);
+      const confirmed = await this.readPollingRate(feature);
+      if (confirmed !== pollingRateHz) {
+        throw new Error(`The mouse kept ${confirmed} Hz instead of ${pollingRateHz} Hz.`);
+      }
+      return confirmed;
+    }
+
     const rateIndex = REPORT_RATE_HZ.indexOf(pollingRateHz as (typeof REPORT_RATE_HZ)[number]);
     if (rateIndex < 0) {
       throw new Error("Unsupported polling rate.");
     }
-
-    await this.ensureHostControl();
-    const feature = await this.getFeature(FEATURE.extendedReportRate);
-    if (!feature.index) {
-      throw new Error("This mouse does not expose report-rate controls.");
-    }
     const confirmation = this.waitForRateChange(pollingRateHz);
-    await this.request(feature.index, 0x30, rateIndex);
+    await this.request(feature.info.index, 0x30, rateIndex);
     await confirmation;
     return pollingRateHz;
   }
 
   async getDpiOptions(): Promise<number[]> {
+    await this.open();
     if (this.dpiOptionsCache) {
       return this.dpiOptionsCache;
     }
-    const feature = await this.getFeature(FEATURE.extendedDpi);
-    if (!feature.index) {
-      throw new Error("This mouse does not expose extended DPI controls.");
-    }
+    const feature = await this.getDpiFeature();
 
     const bytes: number[] = [];
     for (let page = 0; page < 32; page += 1) {
-      const reply = await this.request(feature.index, 0x20, 0x00, 0x00, page);
-      bytes.push(...reply.slice(6));
+      const reply = feature.kind === "extended"
+        ? await this.request(feature.info.index, 0x20, 0x00, 0x00, page)
+        : await this.request(feature.info.index, 0x10, 0x00, 0x00, page);
+      bytes.push(...reply.slice(feature.kind === "extended" ? 6 : 4));
       if (bytes.some((value, index) => index > 0 && bytes[index - 1] === 0 && value === 0)) {
         break;
       }
@@ -264,9 +302,21 @@ export class LogitechHidppClient {
     }
 
     await this.ensureHostControl();
-    const feature = await this.getFeature(FEATURE.extendedDpi);
-    const current = await this.readDpiConfiguration(feature.index);
-    await this.requestLong(feature.index, 0x60, [
+    const feature = await this.getDpiFeature();
+    if (feature.kind === "adjustable") {
+      if (dpiY !== dpi) {
+        throw new Error("This mouse does not support separate X/Y DPI values.");
+      }
+      await this.request(feature.info.index, 0x30, 0x00, dpi >> 8, dpi & 0xff);
+      const confirmed = await this.readDpi(feature);
+      if (confirmed.dpi !== dpi) {
+        throw new Error(`The mouse kept ${confirmed.dpi} DPI instead of ${dpi} DPI.`);
+      }
+      return confirmed.dpi;
+    }
+
+    const current = await this.readDpiConfiguration(feature.info.index);
+    await this.requestLong(feature.info.index, 0x60, [
       0x00,
       dpi >> 8,
       dpi & 0xff,
@@ -274,7 +324,7 @@ export class LogitechHidppClient {
       dpiY & 0xff,
       current.lod,
     ]);
-    const confirmed = await this.readDpiConfiguration(feature.index);
+    const confirmed = await this.readDpiConfiguration(feature.info.index);
     if (confirmed.x !== dpi || confirmed.y !== dpiY) {
       throw new Error(`The mouse kept ${confirmed.x}/${confirmed.y} DPI instead of ${dpi}/${dpiY} DPI.`);
     }
@@ -282,17 +332,18 @@ export class LogitechHidppClient {
   }
 
   async setLiftOffDistance(liftOffDistance: NonNullable<LogitechMouseStatus["liftOffDistance"]>): Promise<NonNullable<LogitechMouseStatus["liftOffDistance"]>> {
+    await this.open();
     if (liftOffDistance === "Low") {
       throw new Error("This mouse does not support a Low lift-off distance.");
     }
     const lod = ({ Low: 0, Medium: 1, High: 2 } as const)[liftOffDistance];
     await this.ensureHostControl();
-    const feature = await this.getFeature(FEATURE.extendedDpi);
-    if (!feature.index) {
+    const feature = await this.getDpiFeature();
+    if (feature.kind !== "extended") {
       throw new Error("This mouse does not expose lift-off-distance controls.");
     }
-    const current = await this.readDpiConfiguration(feature.index);
-    await this.requestLong(feature.index, 0x60, [
+    const current = await this.readDpiConfiguration(feature.info.index);
+    await this.requestLong(feature.info.index, 0x60, [
       0x00,
       current.x >> 8,
       current.x & 0xff,
@@ -300,7 +351,7 @@ export class LogitechHidppClient {
       current.y & 0xff,
       lod,
     ]);
-    const confirmed = await this.readDpiConfiguration(feature.index);
+    const confirmed = await this.readDpiConfiguration(feature.info.index);
     const result = confirmed.lod === 0 ? "Low" : confirmed.lod === 1 ? "Medium" : confirmed.lod === 2 ? "High" : null;
     if (result !== liftOffDistance) {
       throw new Error(`The mouse kept ${result ?? "an unknown"} lift-off distance instead of ${liftOffDistance}.`);
@@ -320,6 +371,22 @@ export class LogitechHidppClient {
     const feature = { index: reply[3] ?? 0, version: reply[6] ?? 0 };
     if (featureId === FEATURE.extendedReportRate) this.reportRateFeatureIndex = feature.index;
     return feature;
+  }
+
+  private async getDpiFeature(): Promise<DpiFeature> {
+    const extended = await this.getFeature(FEATURE.extendedDpi);
+    if (extended.index) return { kind: "extended", info: extended };
+    const adjustable = await this.getFeature(FEATURE.adjustableDpi);
+    if (adjustable.index) return { kind: "adjustable", info: adjustable };
+    throw new Error("This Logitech mouse does not expose DPI controls.");
+  }
+
+  private async getReportRateFeature(): Promise<ReportRateFeature> {
+    const extended = await this.getFeature(FEATURE.extendedReportRate);
+    if (extended.index) return { kind: "extended", info: extended };
+    const standard = await this.getFeature(FEATURE.reportRate);
+    if (standard.index) return { kind: "standard", info: standard };
+    throw new Error("This Logitech mouse does not expose report-rate controls.");
   }
 
   private async readName(featureIndex: number): Promise<string> {
@@ -346,6 +413,19 @@ export class LogitechHidppClient {
       0x04: "Charging slowly",
     } as const)[reply[5] ?? -1] ?? "Unknown";
     return { percent: percentage <= 100 ? percentage : null, state };
+  }
+
+  private async readBatteryStatus(featureIndex: number): Promise<BatteryReading> {
+    const reply = await this.request(featureIndex, 0x00);
+    const percentage = reply[3] ?? 0;
+    const state = ({
+      0x00: "Discharging",
+      0x01: "Charging",
+      0x02: "Almost full",
+      0x03: "Full",
+      0x04: "Charging slowly",
+    } as const)[reply[5] ?? -1] ?? "Unknown";
+    return { percent: percentage > 0 && percentage <= 100 ? percentage : null, state };
   }
 
   private async readBatteryVoltage(featureIndex: number): Promise<BatteryReading> {
@@ -395,21 +475,26 @@ export class LogitechHidppClient {
     return 0;
   }
 
-  private async readDpi(featureIndex: number): Promise<{ dpi: number; dpiY: number; liftOffDistance: LogitechMouseStatus["liftOffDistance"] }> {
-    if (!featureIndex) {
-      throw new Error("This Logitech mouse does not expose extended DPI controls.");
+  private async readDpi(feature: DpiFeature): Promise<{ dpi: number; dpiY: number; liftOffDistance: LogitechMouseStatus["liftOffDistance"] }> {
+    if (feature.kind === "adjustable") {
+      const reply = await this.request(feature.info.index, 0x20);
+      const activeDpi = ((reply[4] ?? 0) << 8) | (reply[5] ?? 0);
+      const defaultDpi = ((reply[6] ?? 0) << 8) | (reply[7] ?? 0);
+      const dpi = activeDpi || defaultDpi;
+      if (!dpi) throw new Error("The mouse returned an invalid DPI value.");
+      return { dpi, dpiY: dpi, liftOffDistance: null };
     }
 
-    const configuration = await this.readDpiConfiguration(featureIndex);
+    const configuration = await this.readDpiConfiguration(feature.info.index);
     const dpi = configuration.x;
     const lod = configuration.lod;
     const liftOffDistance = lod === 0 ? "Low" : lod === 1 ? "Medium" : lod === 2 ? "High" : null;
     return { dpi, dpiY: configuration.y, liftOffDistance };
   }
 
-  private async readDpiCapabilities(featureIndex: number): Promise<boolean> {
-    if (!featureIndex) return false;
-    const reply = await this.request(featureIndex, 0x10, 0x00);
+  private async readDpiCapabilities(feature: DpiFeature): Promise<boolean> {
+    if (feature.kind === "adjustable") return false;
+    const reply = await this.request(feature.info.index, 0x10, 0x00);
     return ((reply[5] ?? 0) & 0x01) !== 0;
   }
 
@@ -420,19 +505,30 @@ export class LogitechHidppClient {
     return { x, y, lod: reply[12] ?? 0 };
   }
 
-  private async readSupportedPollingRates(featureIndex: number): Promise<number[]> {
-    if (!featureIndex) return [];
-    const reply = await this.request(featureIndex, 0x10);
+  private async readSupportedPollingRates(feature: ReportRateFeature): Promise<number[]> {
+    if (feature.kind === "standard") {
+      const reply = await this.request(feature.info.index, 0x00);
+      const flags = reply[3] ?? 0;
+      return Array.from({ length: 8 }, (_unused, index) => index + 1)
+        .filter((periodMs) => (flags & (1 << (periodMs - 1))) !== 0)
+        .map((periodMs) => 1000 / periodMs);
+    }
+    const reply = await this.request(feature.info.index, 0x10);
     const flags = ((reply[3] ?? 0) << 8) | (reply[4] ?? 0);
     return REPORT_RATE_HZ.filter((_rate, index) => (flags & (1 << index)) !== 0);
   }
 
-  private async readPollingRate(featureIndex: number): Promise<number> {
-    if (!featureIndex) {
-      throw new Error("This Logitech mouse does not expose extended report-rate controls.");
+  private async readPollingRate(feature: ReportRateFeature): Promise<number> {
+    if (feature.kind === "standard") {
+      const reply = await this.request(feature.info.index, 0x10);
+      const periodMs = reply[3] ?? 0;
+      if (periodMs < 1 || periodMs > 8) {
+        throw new Error("The mouse returned an unknown report-rate value.");
+      }
+      return 1000 / periodMs;
     }
 
-    const reply = await this.request(featureIndex, 0x20);
+    const reply = await this.request(feature.info.index, 0x20);
     const rate = REPORT_RATE_HZ[reply[3] ?? -1];
     if (!rate) {
       throw new Error("The mouse returned an unknown report-rate value.");
@@ -442,7 +538,7 @@ export class LogitechHidppClient {
 
   private waitForRateChange(rate: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
+      const timeout = globalThis.setTimeout(() => {
         const index = this.rateChangeWaiters.findIndex((waiter) => waiter.reject === reject);
         if (index >= 0) this.rateChangeWaiters.splice(index, 1);
         reject(new Error("The mouse acknowledged the rate write but did not confirm the new active rate."));
@@ -450,7 +546,7 @@ export class LogitechHidppClient {
       this.rateChangeWaiters.push({
         rate,
         resolve: () => {
-          window.clearTimeout(timeout);
+          globalThis.clearTimeout(timeout);
           resolve();
         },
         reject,
@@ -569,7 +665,7 @@ export class LogitechHidppClient {
 
   private waitForResponse(featureIndex: number, functionId: number): Promise<Uint8Array> {
     return new Promise<Uint8Array>((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
+      const timeout = globalThis.setTimeout(() => {
         const index = this.waiters.findIndex((waiter) => waiter.reject === reject);
         if (index >= 0) {
           this.waiters.splice(index, 1);
@@ -581,7 +677,7 @@ export class LogitechHidppClient {
         featureIndex,
         functionId,
         resolve: (report) => {
-          window.clearTimeout(timeout);
+          globalThis.clearTimeout(timeout);
           resolve(report);
         },
         reject,
